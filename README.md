@@ -4,7 +4,7 @@ Talk to Claude Code hands-free. Say your prompt, and Claude reads its reply out 
 
 - 🎙️ **Speech in:** local [Whisper](https://github.com/SYSTRAN/faster-whisper) (`base.en`) runs on your own machine. Your audio never leaves your PC.
 - 🔊 **Speech out:** replies are read aloud by the Windows voice. Code blocks are skipped, and long answers are cut short with "the rest is on screen".
-- 🔁 **Turn-taking:** listening pauses while Claude thinks and speaks, then resumes, so it never hears itself.
+- ✋ **Cut in any time:** talk over a reply and it stops, and what you said becomes your next prompt. Saying just "stop" stops it. Typing anything stops it too. It tells your voice from its own echo, so it never interrupts itself.
 - 📊 **Status band** above the prompt shows the current state, a mic level meter, and the last thing it heard.
 
 ## Requirements
@@ -48,12 +48,15 @@ In the Claude desktop app, where `/plugin` doesn't run: click **+** next to the 
 | Command | What it does |
 | --- | --- |
 | `/voice-chat on` | Start the mic listener. When the band shows **Listening**, just talk. |
+| `/voice-chat stop` | Cut the reply being read out short and listen. |
 | `/voice-chat off` | Stop listening and release the mic. |
 | `/voice-chat` | Toggle. |
 
 When you stop talking for about a second and a half, what you said is sent as your prompt. A shorter pause to think doesn't cut you off: keep going and it's all sent together.
 
-You can type at any time. A typed prompt stops the mic until its reply is done.
+You can type at any time. A typed prompt stops any reply being read out, and the mic waits until its own reply is done.
+
+To cut in by voice, just talk over the reply. Give it a second or two first: it needs to hear a little of its own voice to tell yours apart, and in the first moments it won't stop for you. Talking over it works best on a laptop or headset mic that cancels echo (most do); with loud external speakers and a plain mic, type or use `/voice-chat stop` instead.
 
 ## Notes
 

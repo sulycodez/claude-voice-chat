@@ -1,12 +1,14 @@
-"""voice-chat listener: mic -> Whisper -> text, served to the Claude mod on localhost.
+"""voice-chat listener: mic -> Whisper -> text, and replies read aloud, served to the Claude mod on localhost.
 
-GET  /poll    -> {"texts": [...], "state": "loading|listening|transcribing|paused|error",
+GET  /poll    -> {"texts": [...], "state": "loading|listening|transcribing|speaking|paused|error",
                   "level": 0..1, "error": "..."}
-POST /listen  -> resume listening      POST /pause -> stop listening
+POST /listen  -> resume listening      POST /pause -> stop listening (and any speech)
+POST /speak   -> body {"text", "voice"}: read it aloud, then listen. Talking over it interrupts.
+POST /stop    -> stop speaking now and listen
 POST /quit    -> exit
 Exits by itself if nobody polls for WATCHDOG_S seconds (mod unloaded / session closed).
 """
-import argparse, json, queue, sys, threading, time, traceback
+import argparse, json, os, queue, re, subprocess, sys, tempfile, threading, time, traceback, wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 p = argparse.ArgumentParser()
@@ -25,7 +27,16 @@ MAX_THRESHOLD = 0.04                # so a noisy start can never make a normal v
 FLOOR_WINDOW = 330                  # frames (10 s) the noise floor is re-measured over, all the time
 NO_AUDIO_S = 3                      # no frames from the mic this long means it was unplugged or taken
 WATCHDOG_S = 20
+VERSION = 3                         # the mod replaces a listener that reports another version
 JUNK = {"", "you", "thank you", "thanks for watching", "bye", "uh", "um", "hmm", "."}
+# Talking over a reply: your voice has to beat the reply's own echo by this much, for this long.
+BARGE_RATIO, BARGE_FRAMES, BARGE_WINDOW = 3.0, 6, 12  # loud in 6 of any 12 frames (360 ms): a short "stop" counts, a click doesn't
+# Windows' echo cancelling takes about a second to lock on at the start of each reply, and lets
+# the reply through loudly until then (measured on a laptop mic array), so no interrupting
+# in that first stretch.
+BARGE_GRACE_S = 1.5
+STOP_WORDS = {"stop", "stop it", "stop stop", "okay stop", "ok stop", "shut up", "skip", "skip it",
+              "enough", "that's enough", "quiet", "be quiet", "cancel", "never mind", "nevermind"}
 
 def log(*a):
     if args.log:
@@ -44,18 +55,134 @@ class H(BaseHTTPRequestHandler):
     def do_GET(self):
         with lock:
             S["last_poll"] = time.time()
-            body = {"texts": S["texts"], "state": S["state"], "level": round(S["level"], 3), "error": S["error"]}
+            body = {"texts": S["texts"], "state": S["state"], "level": round(S["level"], 3), "error": S["error"],
+                    "version": VERSION}
             S["texts"] = []
         self._ok(body)
     def do_POST(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        try:
+            data = json.loads(self.rfile.read(n) or b"{}") if n else {}
+        except ValueError:
+            data = {}
+        speak = None
         with lock:
             S["last_poll"] = time.time()
             busy = S["state"] in ("loading", "error")
             if self.path == "/listen" and not busy: S["state"] = "listening"
             elif self.path == "/pause" and not busy: S["state"] = "paused"
+            elif self.path == "/stop" and not busy: S["state"] = "listening"
+            elif self.path == "/speak" and not busy and str(data.get("text", "")).strip():
+                S["state"] = "speaking"; speak = (str(data["text"]), str(data.get("voice", "")))
+            elif self.path == "/speak" and not busy: S["state"] = "listening"
             elif self.path == "/quit": S["quit"] = True
             body = {"state": S["state"]}
+        if SPEAKER:
+            if speak: SPEAKER.speak(*speak)
+            elif self.path in ("/pause", "/stop", "/listen", "/quit"): SPEAKER.stop()
         self._ok(body)
+
+SPEAKER = None
+
+def synth(text, voice, np):
+    """Windows' own voice renders the text to a 16 kHz WAV, read back as float samples."""
+    fd, path = tempfile.mkstemp(suffix=".wav"); os.close(fd)
+    q = lambda v: v.replace("'", "''")
+    ps = ("[Console]::InputEncoding = [Text.Encoding]::UTF8; Add-Type -AssemblyName System.Speech; "
+          "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+          "try { $s.SelectVoice('" + q(voice) + "') } catch {}; $s.Rate = 1; "
+          "$f = New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo(16000, "
+          "[System.Speech.AudioFormat.AudioBitsPerSample]::Sixteen, [System.Speech.AudioFormat.AudioChannel]::Mono); "
+          "$s.SetOutputToWaveFile('" + q(path) + "', $f); $s.Speak([Console]::In.ReadToEnd()); $s.Dispose()")
+    try:
+        subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], input=text.encode("utf-8"),
+                       capture_output=True, timeout=60, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        with wave.open(path) as w:
+            return np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype("float32") / 32768
+    finally:
+        try: os.remove(path)
+        except OSError: pass
+
+class Speaker:
+    """Plays replies and remembers how loud each 30 ms of it was, so the mic loop can
+    tell the reply's echo from you talking over it."""
+    def __init__(self, np, sd):
+        self.np, self.sd = np, sd
+        self.mx = threading.Lock()
+        self.gen, self.stream, self.ref = 0, None, []
+        self.audible_since = None   # when the reply first made a sound
+
+    def speak(self, text, voice):
+        gen = self.stop()
+        threading.Thread(target=self._play, args=(text, voice, gen), daemon=True).start()
+
+    def stop(self):
+        with self.mx:
+            self.gen += 1; st, self.stream = self.stream, None
+        if st is not None:
+            try: st.abort(); st.close()
+            except Exception: pass
+        return self.gen
+
+    def _play(self, text, voice, gen):
+        np, sd = self.np, self.sd
+        t0 = time.time()
+        # Render a sentence or two at a time and start playing after the first, so a
+        # long reply starts as fast as a short one; the rest renders while it plays.
+        pieces, cur = [], ""
+        for part in re.split(r"(?<=[.!?])\s+", text.strip()):
+            cur = (cur + " " + part).strip()
+            if len(cur) >= (80 if not pieces else 240):
+                pieces.append(cur); cur = ""
+        if cur: pieces.append(cur)
+        def render(piece):
+            try:
+                return synth(piece, voice, np)
+            except Exception as e:
+                log("speech failed:", repr(e)); return np.zeros(0, dtype="float32")
+        buf = {"a": render(pieces[0]) if pieces else np.zeros(0, dtype="float32"), "done": len(pieces) <= 1}
+        log(f"speaking, first part {len(buf['a']) / RATE:.1f}s rendered in {time.time() - t0:.1f}s, {len(pieces)} parts")
+        def render_rest():
+            for piece in pieces[1:]:
+                if self.gen != gen: return
+                buf["a"] = np.concatenate([buf["a"], render(piece)])
+            buf["done"] = True
+        threading.Thread(target=render_rest, daemon=True).start()
+        audio = buf["a"]
+        pos, ref = [0], []
+        self.audible_since = None
+        def cb(outdata, frames, t, status):
+            a = buf["a"]
+            chunk = a[pos[0]:pos[0] + frames]
+            pos[0] += len(chunk)          # a gap while the next part renders plays as silence
+            outdata[:len(chunk), 0] = chunk
+            outdata[len(chunk):, 0] = 0
+            r = float(np.sqrt(np.mean(chunk ** 2))) if len(chunk) else 0.0
+            ref.append((time.time(), r))
+            if r > 0.003 and self.audible_since is None: self.audible_since = time.time()
+            if len(ref) > 100: del ref[0]
+            if buf["done"] and pos[0] >= len(buf["a"]): raise sd.CallbackStop()
+        def finished():
+            with self.mx:
+                if self.gen != gen: return
+                self.stream = None
+            with lock:
+                if S["state"] == "speaking": S["state"] = "listening"
+            log("spoke to the end")
+        with self.mx:
+            if self.gen != gen: return
+            if not len(audio) and buf["done"]:
+                with lock:
+                    if S["state"] == "speaking": S["state"] = "listening"
+                return
+            self.ref = ref
+            self.stream = sd.OutputStream(samplerate=RATE, channels=1, dtype="float32", blocksize=FRAME,
+                                          callback=cb, finished_callback=finished)
+            self.stream.start()
+
+    def echo(self, now):
+        """The loudest the reply was over the last 450 ms: the most its echo in the mic can be."""
+        return max((r for t, r in self.ref[-15:] if now - t <= 0.45), default=0.0)
 
 def should_stop():
     with lock:
@@ -69,6 +196,8 @@ def run():
     from faster_whisper import WhisperModel
     model = WhisperModel(args.model, device="cpu", compute_type="int8")
     log("model ready")
+    global SPEAKER
+    SPEAKER = Speaker(np, sd)
 
     audio_q: "queue.Queue[np.ndarray]" = queue.Queue()
     def cb(indata, frames, t, status):
@@ -100,9 +229,12 @@ def run():
         speech, silent_frames, in_speech = [], 0, False
         pre = calib[-PRE_ROLL:]     # pre-roll so the first syllable isn't cut (and words said while calibrating count)
         pending, send_at = [], 0.0  # finished utterances waiting out HOLD_S in case you carry on
+        loud, ratios, gain, barged = [], [], 1.0, False   # talking over a reply
+        margins = []
         while not should_stop():
             with lock:
-                listening = S["state"] in ("listening", "transcribing")
+                state = S["state"]
+                listening = state in ("listening", "transcribing")
             if pending and not in_speech and time.time() >= send_at:
                 text = " ".join(pending); pending = []
                 log("sent:", repr(text))
@@ -125,6 +257,37 @@ def run():
                 if abs(new[1] - threshold) > threshold * 0.25: log(f"noise floor {new[0]:.4f} threshold {new[1]:.4f}")
                 floor, threshold, quiet = new
             with lock: S["level"] = min(1.0, rms / (threshold * 4))
+            if state == "speaking":
+                # How much of the reply reaches the mic: a high percentile of the mic/reply
+                # ratio, learned afresh each reply from frames that weren't you talking.
+                # You talking over it has to be well above that.
+                speech, in_speech, pending = [], False, []
+                pre = (pre + [frame])[-BARGE_WINDOW:]
+                now = time.time()
+                e = SPEAKER.echo(now) if SPEAKER else 0.0
+                since = SPEAKER.audible_since if SPEAKER else None
+                if since is None or now - since < BARGE_GRACE_S:
+                    loud = []
+                    continue
+                bar = max(threshold * 3, BARGE_RATIO * gain * e + threshold)
+                if e > 0.003 and rms < bar:
+                    ratios = (ratios + [rms / e])[-100:]
+                    if len(ratios) >= 15: gain = min(max(float(np.percentile(ratios, 90)), 0.01), 2.0)
+                margins.append(rms / bar)
+                loud = (loud + [rms > bar])[-BARGE_WINDOW:]
+                if sum(loud) >= BARGE_FRAMES:
+                    log(f"talked over the reply (mic {rms:.3f}, echo {gain * e:.3f})")
+                    SPEAKER.stop()
+                    with lock:
+                        if S["state"] == "speaking": S["state"] = "transcribing"
+                    in_speech, speech, silent_frames, barged, loud = True, list(pre), 0, True, []
+                continue
+            if margins:
+                m = sorted(margins)
+                log(f"echo vs barge bar while speaking: p50 {m[len(m) // 2]:.2f} p99 {m[int(len(m) * 0.99)]:.2f} "
+                    f"max {m[-1]:.2f} (1.0 interrupts), gain {gain:.3f}")
+                margins = []
+            loud, ratios, gain = [], [], 1.0
             if not listening:
                 speech, in_speech, pre, pending = [], False, [], []
                 continue
@@ -150,6 +313,9 @@ def run():
                 with lock: S["state"] = "transcribing"
                 text = transcribe(buf)
                 log("heard:", repr(text))
+                if barged and text.lower().strip(" .!?,") in STOP_WORDS:
+                    text = ""   # "stop" just stops the reply
+                barged = False
                 if text:
                     pending.append(text); send_at = time.time() + HOLD_S
                 elif not pending:
