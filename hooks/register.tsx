@@ -67,11 +67,14 @@ function speakable(md: string): string {
     .replace(/```[\s\S]*?```/g, ' (code on screen) ')
     .replace(/`([^`]+)`/g, '$1')
     .replace(/!?\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .replace(/https?:\/\/\S+/g, 'a link')
     .replace(/^#+\s*/gm, '')
     .replace(/^\s*[-*+]\s+/gm, '')
     .replace(/^\s*\|.*\|\s*$/gm, '')
+    .replace(/\s*(->|→|=>)\s*/g, ' to ')
+    // Emoji, check marks and other symbols read out as their Unicode names.
+    .replace(/[\p{Extended_Pictographic}←-⇿─-➿️‍]/gu, '')
     .replace(/[*_~>#|]/g, '')
-    .replace(/https?:\/\/\S+/g, 'a link')
     .replace(/\s+/g, ' ')
     .trim()
   if (t.length > MAX_SPOKEN) {
@@ -90,6 +93,8 @@ async function say($: EngineInterface, text: string) {
     // No platform synthesizer from the engine here: use Windows SAPI directly.
   }
   const ps =
+    // UTF-8 in: Windows PowerShell reads stdin in the console code page, and "café" came out as "calf register trademark".
+    '[Console]::InputEncoding = [Text.Encoding]::UTF8; ' +
     'Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; ' +
     `try { $s.SelectVoice('${VOICE}') } catch {}; $s.Rate = 1; $s.Speak([Console]::In.ReadToEnd())`
   await $.process.run(['powershell', '-NoProfile', '-NonInteractive', '-Command', ps], {
@@ -106,7 +111,9 @@ async function startListener($: EngineInterface): Promise<boolean> {
     await post($, '/quit')
     await $.clock.sleep(1500)
   }
-  const fwd = (p: string) => p.split(BACKSLASH).join('/')
+  // Forward slashes, and ' doubled: the paths sit in single-quoted PowerShell
+  // strings, and a folder like C:/Users/O'Brien would otherwise end the string.
+  const fwd = (p: string) => p.split(BACKSLASH).join('/').split("'").join("''")
   const script = fwd(`${$.plugin.root}/scripts/listener.py`)
   const log = fwd(`${$.plugin.root}/scripts/listener.log`)
   const ps =
@@ -137,7 +144,13 @@ function startPolling($: EngineInterface) {
       if (!p) {
         // First start loads the model; allow about a minute before calling it failed.
         misses += 1
-        if (misses > (m === 'starting' ? 150 : 8) && m !== 'error') await fail($, 'listener stopped, see scripts/listener.log')
+        if (misses > (m === 'starting' ? 150 : 8) && m !== 'error')
+          await fail(
+            $,
+            m === 'starting'
+              ? "listener didn't start. Check that python runs in a terminal (not the Microsoft Store stub)"
+              : 'listener stopped, see scripts/listener.log',
+          )
         return
       }
       misses = 0
@@ -190,6 +203,9 @@ export const register: Register = on => {
 
   on('command.run', { command: 'voice-chat' }, async ($, e) => {
     const arg = (e.args ?? '').trim().toLowerCase()
+    if (arg !== '' && arg !== 'on' && arg !== 'off') {
+      return { text: 'Usage: /voice-chat on, /voice-chat off, or /voice-chat to toggle.' }
+    }
     const isOn = (await read($, mode)) !== 'off'
     const want = arg === 'on' ? true : arg === 'off' ? false : !isOn
     if (want) {

@@ -21,6 +21,9 @@ HOLD_S = 0.7                        # then wait this long for more before sendin
 MIN_SPEECH_S, MAX_SPEECH_S = 0.35, 30
 PRE_ROLL = 20                       # frames (0.6 s) kept from before speech starts, so the first word isn't clipped
 MIN_THRESHOLD = 0.005               # quiet laptop mics sit far below the old 0.012
+MAX_THRESHOLD = 0.04                # so a noisy start can never make a normal voice too quiet to hear
+FLOOR_WINDOW = 330                  # frames (10 s) the noise floor is re-measured over, all the time
+NO_AUDIO_S = 3                      # no frames from the mic this long means it was unplugged or taken
 WATCHDOG_S = 20
 JUNK = {"", "you", "thank you", "thanks for watching", "bye", "uh", "um", "hmm", "."}
 
@@ -80,16 +83,22 @@ def run():
         return "" if text.lower().strip(" .!?,") in JUNK else text
 
     with sd.InputStream(samplerate=RATE, channels=1, dtype="float32", blocksize=FRAME, callback=cb):
-        # calibrate noise floor
-        floor_samples = [float(np.sqrt(np.mean(audio_q.get(timeout=5) ** 2))) for _ in range(30)]
-        floor = max(float(np.median(floor_samples)), 0.0005)
-        threshold = max(floor * 4.0, MIN_THRESHOLD)
-        quiet = threshold * 0.6     # hysteresis: once talking, softer sounds still count as speech
+        # Noise floor: the quiet end (20th percentile) of recent frames, so someone
+        # already talking when the mic opens doesn't set it, and it keeps up with
+        # a fan or a TV that starts later.
+        calib = [audio_q.get(timeout=5) for _ in range(30)]
+        recent = [float(np.sqrt(np.mean(f ** 2))) for f in calib]
+        def levels():
+            floor = max(float(np.percentile(recent, 20)), 0.0005)
+            thr = min(max(floor * 4.0, MIN_THRESHOLD), MAX_THRESHOLD)
+            return floor, thr, thr * 0.6   # hysteresis: once talking, softer sounds still count
+        floor, threshold, quiet = levels()
         log(f"noise floor {floor:.4f} threshold {threshold:.4f}")
         with lock: S["state"] = "listening"
+        last_frame, n = time.time(), 0
 
         speech, silent_frames, in_speech = [], 0, False
-        pre = []                    # pre-roll so the first syllable isn't cut
+        pre = calib[-PRE_ROLL:]     # pre-roll so the first syllable isn't cut (and words said while calibrating count)
         pending, send_at = [], 0.0  # finished utterances waiting out HOLD_S in case you carry on
         while not should_stop():
             with lock:
@@ -104,8 +113,17 @@ def run():
             try:
                 frame = audio_q.get(timeout=0.2)
             except queue.Empty:
+                if time.time() - last_frame > NO_AUDIO_S:
+                    raise RuntimeError("the microphone stopped sending audio (unplugged, or another app took it)")
                 continue
+            last_frame = time.time()
             rms = float(np.sqrt(np.mean(frame ** 2)))
+            recent.append(rms); n += 1
+            if len(recent) > FLOOR_WINDOW: del recent[0]
+            if n % 33 == 0:
+                new = levels()
+                if abs(new[1] - threshold) > threshold * 0.25: log(f"noise floor {new[0]:.4f} threshold {new[1]:.4f}")
+                floor, threshold, quiet = new
             with lock: S["level"] = min(1.0, rms / (threshold * 4))
             if not listening:
                 speech, in_speech, pre, pending = [], False, [], []
@@ -138,8 +156,18 @@ def run():
                     with lock:
                         if S["state"] == "transcribing": S["state"] = "listening"
 
+class Server(ThreadingHTTPServer):
+    # Windows lets a second socket share a port with SO_REUSEADDR, which would
+    # leave two listeners fighting over the mic. Claim the port alone instead.
+    allow_reuse_address = False
+    def server_bind(self):
+        import socket
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
 try:
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), H)
+    server = Server(("127.0.0.1", args.port), H)
 except OSError:
     log("port busy, another listener is running"); sys.exit(0)
 threading.Thread(target=server.serve_forever, daemon=True).start()

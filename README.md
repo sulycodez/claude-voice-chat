@@ -58,7 +58,9 @@ You can type at any time. A typed prompt stops the mic until its reply is done.
 ## Notes
 
 - Anything the mic picks up while it's listening is sent, a TV or another person included. Turn it off when you aren't using it.
-- It uses the Windows default recording device.
+- It uses the Windows default recording device. If the mic is unplugged or another app takes it, the status band says so; run `/voice-chat on` again once it's back.
+- A prompt of only "thank you", "bye" or "um" is ignored, because Whisper invents those from background noise.
+- Whisper runs on your CPU, so while something heavy is running (a video render, a game) replies take longer to be heard.
 - The listener runs as a small local server on `127.0.0.1:47821`. It exits by itself about 20 seconds after Claude Code stops checking on it.
 - If something goes wrong, the status band says what (a missing package, no Python), and `scripts/listener.log` in the plugin folder has the details.
 - Run the plugin's tests with `claude plugin test <plugin folder>`.
