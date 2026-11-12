@@ -1,0 +1,5 @@
+{
+  "name": "claude-voice-chat",
+  "owner": { "name": "sulycodez" },
+  "plugins": [{ "name": "voice-chat", "source": "./" }]
+}
