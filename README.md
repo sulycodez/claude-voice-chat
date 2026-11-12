@@ -19,6 +19,12 @@ pip install faster-whisper sounddevice numpy
 
 The first time you turn it on, Whisper downloads the `base.en` model (about 150 MB).
 
+- Plugin hooks modules turned on. They are an early-access Claude Code feature, and without this the plugin installs but does nothing. Run this once, then restart Claude Code:
+
+```bash
+setx CLAUDE_CODE_ENABLE_FUNCTION_HOOKS 1
+```
+
 ## Install
 
 At the prompt of a Claude Code terminal session:
@@ -45,11 +51,14 @@ In the Claude desktop app, where `/plugin` doesn't run: click **+** next to the 
 | `/voice-chat off` | Stop listening and release the mic. |
 | `/voice-chat` | Toggle. |
 
-Pause for about a second when you finish a sentence, and what you said is sent as your prompt.
+When you stop talking for about a second and a half, what you said is sent as your prompt. A shorter pause to think doesn't cut you off: keep going and it's all sent together.
+
+You can type at any time. A typed prompt stops the mic until its reply is done.
 
 ## Notes
 
 - Anything the mic picks up while it's listening is sent, a TV or another person included. Turn it off when you aren't using it.
 - It uses the Windows default recording device.
 - The listener runs as a small local server on `127.0.0.1:47821`. It exits by itself about 20 seconds after Claude Code stops checking on it.
-- If something goes wrong, check `scripts/listener.log` in the plugin folder.
+- If something goes wrong, the status band says what (a missing package, no Python), and `scripts/listener.log` in the plugin folder has the details.
+- Run the plugin's tests with `claude plugin test <plugin folder>`.

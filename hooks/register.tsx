@@ -6,12 +6,13 @@ import type { VoiceMode } from '../types'
 const PORT = 47821
 const BASE = `http://127.0.0.1:${PORT}`
 const VOICE = 'Microsoft Hazel Desktop'
-const MAX_SPOKEN = 1200
+const MAX_SPOKEN = 700
 const BACKSLASH = String.fromCharCode(92)
 
 const mode = atom({ plugin: 'voice-chat', key: 'mode' } as const, 'off' as VoiceMode, { shape: 'mode-1' })
 const level = atom({ plugin: 'voice-chat', key: 'level' } as const, 0, { shape: 'level-1' })
 const lastHeard = atom({ plugin: 'voice-chat', key: 'lastHeard' } as const, '', { shape: 'heard-1' })
+const problem = atom({ plugin: 'voice-chat', key: 'problem' } as const, '', { shape: 'problem-1' })
 
 const LABEL: Record<VoiceMode, string | undefined> = {
   off: undefined,
@@ -23,12 +24,20 @@ const LABEL: Record<VoiceMode, string | undefined> = {
   error: '⚠️ Voice: listener not running (/voice-chat on to retry)',
 }
 
-type Poll = { texts: string[]; state: string; level: number }
+type Poll = { texts: string[]; state: string; level: number; error?: string }
 
-// Module variables reset on reload: the polling timer and a re-entry flag.
+// Module variables reset on reload: the polling timer, a re-entry flag, and a
+// count of prompts so a reply that finishes speaking after a newer prompt
+// started doesn't reopen the mic in the middle of that turn.
 let ticker: { cancel: () => void } | undefined
 let polling = false
 let misses = 0
+let promptCount = 0
+
+async function fail($: EngineInterface, why: string) {
+  await update($, problem, () => why)
+  await setMode($, 'error')
+}
 
 async function setMode($: EngineInterface, m: VoiceMode) {
   await update($, mode, () => m)
@@ -89,15 +98,30 @@ async function say($: EngineInterface, text: string) {
   })
 }
 
-async function startListener($: EngineInterface) {
-  if (await poll($)) return
+async function startListener($: EngineInterface): Promise<boolean> {
+  const running = await poll($)
+  if (running && running.state !== 'error') return true
+  if (running) {
+    // A listener that failed earlier: replace it so a retry really retries.
+    await post($, '/quit')
+    await $.clock.sleep(1500)
+  }
   const fwd = (p: string) => p.split(BACKSLASH).join('/')
   const script = fwd(`${$.plugin.root}/scripts/listener.py`)
   const log = fwd(`${$.plugin.root}/scripts/listener.log`)
   const ps =
     `Start-Process -WindowStyle Hidden -FilePath python -ArgumentList ` +
     `'"${script}"','--port','${PORT}','--log','"${log}"'`
-  await $.process.run(['powershell', '-NoProfile', '-NonInteractive', '-Command', ps], { timeoutMs: 20_000 })
+  try {
+    const r = await $.process.run(['powershell', '-NoProfile', '-NonInteractive', '-Command', ps], {
+      timeoutMs: 20_000,
+    })
+    if (r.exitCode === 0) return true
+  } catch {
+    // fall through
+  }
+  await fail($, 'could not start Python. Is python 3.9+ on your PATH?')
+  return false
 }
 
 function startPolling($: EngineInterface) {
@@ -113,10 +137,14 @@ function startPolling($: EngineInterface) {
       if (!p) {
         // First start loads the model; allow about a minute before calling it failed.
         misses += 1
-        if (misses > (m === 'starting' ? 150 : 8) && m !== 'error') await setMode($, 'error')
+        if (misses > (m === 'starting' ? 150 : 8) && m !== 'error') await fail($, 'listener stopped, see scripts/listener.log')
         return
       }
       misses = 0
+      if (p.state === 'error') {
+        if (m !== 'error') await fail($, p.error || 'listener failed, see scripts/listener.log')
+        return
+      }
       await update($, level, () => p.level)
       if (m === 'starting' || m === 'error') {
         if (p.state === 'listening') await setMode($, 'listening')
@@ -137,9 +165,9 @@ function startPolling($: EngineInterface) {
 }
 
 async function turnOn($: EngineInterface) {
+  await update($, problem, () => '')
   await setMode($, 'starting')
-  await startListener($)
-  startPolling($)
+  if (await startListener($)) startPolling($)
 }
 
 async function turnOff($: EngineInterface) {
@@ -175,9 +203,11 @@ export const register: Register = on => {
   })
 
   // A typed prompt while voice is on: stop listening until the reply is done.
+  // That includes while a reply is still being read out.
   on('prompt.submit', async ($, e, next) => {
+    promptCount += 1
     const m = await read($, mode)
-    if (m === 'listening' || m === 'hearing') {
+    if (m === 'listening' || m === 'hearing' || m === 'speaking') {
       await post($, '/pause')
       await setMode($, 'thinking')
     }
@@ -190,6 +220,7 @@ export const register: Register = on => {
     const m = await read($, mode)
     if (m === 'off' || m === 'starting' || m === 'error') return done
     // Speak in the background so the turn ends now.
+    const mine = promptCount
     void (async () => {
       const text = e.reason === 'answer' ? speakable(e.answer) : ''
       if (text) {
@@ -200,7 +231,8 @@ export const register: Register = on => {
           // keep going
         }
       }
-      if ((await read($, mode)) === 'off') return
+      // Off, or a newer prompt is already running: its own end reopens the mic.
+      if ((await read($, mode)) === 'off' || promptCount !== mine) return
       await post($, '/listen')
       await setMode($, 'listening')
     })()
@@ -214,17 +246,19 @@ export const register: Register = on => {
     const { Box, Text } = $.ui.resolve(e)
     const lvl = await read($, level)
     const heard = await read($, lastHeard)
+    const why = await read($, problem)
     const bars = 10
     const lit = m === 'listening' || m === 'hearing' ? Math.round(lvl * bars) : 0
     const meter = '▮'.repeat(lit) + '▯'.repeat(bars - lit)
     const color = m === 'error' ? 'error' : m === 'speaking' ? 'claude' : m === 'thinking' ? 'warning' : 'success'
     return (
       <Box flexDirection="row" gap={2}>
-        <Text color={color} weight="bold">
+        <Text color={color} bold>
           {LABEL[m] ?? ''}
         </Text>
         {(m === 'listening' || m === 'hearing') && <Text color="success">{meter}</Text>}
-        {heard !== '' && (
+        {m === 'error' && why !== '' && <Text color="error">{why}</Text>}
+        {m !== 'error' && heard !== '' && (
           <Text dimColor>last heard: "{heard.length > 60 ? heard.slice(0, 59) + '…' : heard}"</Text>
         )}
       </Box>

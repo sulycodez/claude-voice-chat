@@ -6,6 +6,7 @@ declare module 'claude-code' {
       mode: Shaped<VoiceMode>
       level: Shaped<number>
       lastHeard: Shaped<string>
+      problem: Shaped<string>
     }
   }
 }
