@@ -13,7 +13,7 @@ export function listener(on: On) {
     state: 'listening',
     texts: [] as string[],
     error: '',
-    version: 4 as number | undefined,
+    version: 5 as number | undefined,
     posts: [] as string[],
     spoken: [] as { text: string; voice: string }[],
     polls: 0,

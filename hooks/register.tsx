@@ -7,7 +7,7 @@ const PORT = 47821
 const BASE = `http://127.0.0.1:${PORT}`
 const VOICE = 'Microsoft Hazel Desktop'
 const MAX_SPOKEN = 700
-const LISTENER_VERSION = 4
+const LISTENER_VERSION = 5
 const BACKSLASH = String.fromCharCode(92)
 
 const mode = atom({ plugin: 'voice-chat', key: 'mode' } as const, 'off' as VoiceMode, { shape: 'mode-1' })

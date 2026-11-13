@@ -56,7 +56,7 @@ When you stop talking for about a second and a half, what you said is sent as yo
 
 You can type at any time. A typed prompt stops any reply being read out, and the mic waits until its own reply is done.
 
-To cut in by voice, just talk over the reply. Give it a second or two first: it needs to hear a little of its own voice to tell yours apart, and in the first moments it won't stop for you. Talking over it works best on a laptop or headset mic that cancels echo (most do); with loud external speakers and a plain mic, type or use `/voice-chat stop` instead.
+To cut in by voice, just talk over the reply, as early as you like: it starts listening for you about a second and a half in, keeps what you said from before that, and sends it all as your next prompt. It tells you apart from its own voice by checking whether the mic is following what it plays, so it never cuts itself off. On a laptop or headset mic that cancels echo (most do), a normal voice is enough. With loud speakers and a plain mic you need to be clearly louder than the speakers, or type or use `/voice-chat stop` instead.
 
 ## Notes
 

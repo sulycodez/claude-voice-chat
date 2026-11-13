@@ -27,7 +27,7 @@ MAX_THRESHOLD = 0.04                # so a noisy start can never make a normal v
 FLOOR_WINDOW = 330                  # frames (10 s) the noise floor is re-measured over, all the time
 NO_AUDIO_S = 3                      # no frames from the mic this long means it was unplugged or taken
 WATCHDOG_S = 20
-VERSION = 4                         # the mod replaces a listener that reports another version
+VERSION = 5                         # the mod replaces a listener that reports another version
 JUNK = {"", "you", "thank you", "thanks for watching", "bye", "uh", "um", "hmm", "."}
 # Talking over a reply: your voice has to beat the reply's own echo by this much, for this long.
 BARGE_RATIO, BARGE_FRAMES, BARGE_WINDOW = 3.0, 6, 12  # loud in 6 of any 12 frames (360 ms): a short "stop" counts, a click doesn't
@@ -83,6 +83,26 @@ class H(BaseHTTPRequestHandler):
         self._ok(body)
 
 SPEAKER = None
+
+def fit_echo(np, mic_hist, ref):
+    """Does the mic follow the reply? Correlate the mic's level with the reply's level at
+    each delay up to 0.9 s. A mic with no echo cancelling follows it closely, and then the
+    echo's delay and size are measured. With echo cancelling (most laptop mics) only short
+    random spikes leak, which don't follow the reply: returns "none"."""
+    if len(mic_hist) < 33 or len(ref) < 30: return None
+    mt = np.array([t for t, _ in mic_hist]); mr = np.array([r for _, r in mic_hist])
+    rt = np.array([t for t, _ in ref]); rr = np.array([r for _, r in ref])
+    lm = np.log(mr + 1e-4)
+    best_c, best_lag = -1.0, 0.0
+    for lag in np.arange(0.0, 0.9, 0.03):
+        x = np.interp(mt - lag, rt, rr, left=0.0, right=0.0)
+        if x.std() < 1e-4: continue
+        c = float(np.corrcoef(lm, np.log(x + 1e-4))[0, 1])
+        if c > best_c: best_c, best_lag = c, float(lag)
+    if best_c < 0.5: return "none"
+    x = np.interp(mt - best_lag, rt, rr, left=0.0, right=0.0); act = x > 0.003
+    if act.sum() < 15: return None
+    return (best_lag, min(max(float(np.median(mr[act] / x[act])), 0.01), 2.0), best_c)
 
 def synth(text, voice, np):
     """Windows' own voice renders the text to a 16 kHz WAV, read back as float samples."""
@@ -160,7 +180,7 @@ class Speaker:
             r = float(np.sqrt(np.mean(chunk ** 2))) if len(chunk) else 0.0
             ref.append((time.time(), r))
             if r > 0.003 and self.audible_since is None: self.audible_since = time.time()
-            if len(ref) > 100: del ref[0]
+            if len(ref) > 200: del ref[0]
             if buf["done"] and pos[0] >= len(buf["a"]): raise sd.CallbackStop()
         def finished():
             with self.mx:
@@ -180,9 +200,9 @@ class Speaker:
                                           callback=cb, finished_callback=finished)
             self.stream.start()
 
-    def echo(self, now):
-        """The loudest the reply was over the last 450 ms: the most its echo in the mic can be."""
-        return max((r for t, r in self.ref[-15:] if now - t <= 0.45), default=0.0)
+    def echo(self, now, lag):
+        """How loud the reply was when the sound now reaching the mic left the speaker."""
+        return max((r for t, r in self.ref[-40:] if abs(now - lag - t) <= 0.075), default=0.0)
 
 def should_stop():
     with lock:
@@ -229,8 +249,10 @@ def run():
         speech, silent_frames, in_speech = [], 0, False
         pre = calib[-PRE_ROLL:]     # pre-roll so the first syllable isn't cut (and words said while calibrating count)
         pending, send_at = [], 0.0  # finished utterances waiting out HOLD_S in case you carry on
-        loud, ratios, gain, barged = [], [], 1.0, False   # talking over a reply
-        known = None   # how much echo this mic lets through, carried from earlier replies
+        # Talking over a reply. echo_model: what reaches the mic from the speaker. None until
+        # measured, "none" when echo cancelling removes it, or (delay, size, fit). It is kept
+        # only from replies nobody talked over, so your voice is never learned as echo.
+        loud, barged, echo_model, mic_hist, reply_model, reply_barged = [], False, None, [], None, False
         margins = []
         while not should_stop():
             with lock:
@@ -259,42 +281,53 @@ def run():
                 floor, threshold, quiet = new
             with lock: S["level"] = min(1.0, rms / (threshold * 4))
             if state == "speaking":
-                # How much of the reply reaches the mic: a high percentile of the mic/reply
-                # ratio over frames that weren't you talking. It carries over from earlier
-                # replies and can only creep up, because if you talk early in a reply your
-                # voice would otherwise be learned as echo, and then nothing you say beats it.
                 speech, in_speech, pending = [], False, []
-                pre = (pre + [frame])[-BARGE_WINDOW:]
+                pre = (pre + [frame])[-100:]   # 3 s, so cutting in late still keeps your first words
                 now = time.time()
-                e = SPEAKER.echo(now) if SPEAKER else 0.0
                 since = SPEAKER.audible_since if SPEAKER else None
                 if since is None or now - since < BARGE_GRACE_S:
                     loud = []
                     continue
-                bar = max(threshold * 3, BARGE_RATIO * gain * e + threshold)
-                if e > 0.003 and rms < bar:
-                    ratios = (ratios + [rms / e])[-100:]
-                    if len(ratios) >= 15:
-                        est = float(np.percentile(ratios, 90))
-                        gain = min(max(est if known is None else min(est, known * 1.5), 0.01), 2.0)
+                mic_hist = (mic_hist + [(now, rms)])[-130:]
+                if n % 11 == 0 and echo_model is None:
+                    # Nothing kept from an earlier reply: measure on this one (your voice
+                    # doesn't follow the reply either, so it can't pass for echo here).
+                    reply_model = fit_echo(np, mic_hist, SPEAKER.ref) or reply_model
+                use = echo_model if echo_model is not None else reply_model
+                if use is None:
+                    loud = []      # first reply, not measured yet (about 2 s in)
+                    continue
+                if use == "none":
+                    bar, e = threshold * 3, 0.0
+                else:
+                    e = SPEAKER.echo(now, use[0])
+                    # A tight fit means the echo estimate is precise, so a smaller margin is safe.
+                    bar = max(threshold * 3, (2.0 if use[2] >= 0.8 else BARGE_RATIO) * use[1] * e + threshold)
                 margins.append(rms / bar)
                 loud = (loud + [rms > bar])[-BARGE_WINDOW:]
                 if sum(loud) >= BARGE_FRAMES:
-                    log(f"talked over the reply (mic {rms:.3f}, echo {gain * e:.3f})")
+                    log(f"talked over the reply (mic {rms:.3f}, bar {bar:.3f}, echo model {use if use == 'none' else tuple(round(v, 3) for v in use)})")
                     SPEAKER.stop()
                     with lock:
                         if S["state"] == "speaking": S["state"] = "transcribing"
-                    in_speech, speech, silent_frames, barged, loud = True, list(pre), 0, True, []
+                    # Rewind to where you started: back to the last half second of quiet.
+                    start, q = len(pre), 0
+                    for i in range(len(pre) - 1, -1, -1):
+                        q = q + 1 if float(np.sqrt(np.mean(pre[i] ** 2))) < threshold * 2 else 0
+                        if q >= 17: break
+                        start = i
+                    in_speech, speech, silent_frames, barged, loud, reply_barged = True, pre[max(start - 5, 0):], 0, True, [], True
                 continue
             if margins:
                 m = sorted(margins)
-                log(f"echo vs barge bar while speaking: p50 {m[len(m) // 2]:.2f} p99 {m[int(len(m) * 0.99)]:.2f} "
-                    f"max {m[-1]:.2f} (1.0 interrupts), gain {gain:.3f}")
+                if not reply_barged and m[int(len(m) * 0.9)] < 0.5:
+                    # Played to the end with nobody near the interrupt bar: the cleanest measure. Keep it.
+                    fitted = fit_echo(np, mic_hist, SPEAKER.ref) if SPEAKER else None
+                    if fitted is not None: echo_model = fitted
+                log(f"loudest echo vs interrupt bar: p50 {m[len(m) // 2]:.2f} p99 {m[int(len(m) * 0.99)]:.2f} "
+                    f"max {m[-1]:.2f} (1.0 interrupts); echo model {echo_model if not isinstance(echo_model, tuple) else tuple(round(v, 3) for v in echo_model)}")
                 margins = []
-                if len(ratios) >= 15:
-                    known = gain if known is None else min(known * 1.5, 0.7 * known + 0.3 * gain)
-            loud, ratios = [], []
-            gain = known if known is not None else 1.0
+            loud, mic_hist, reply_model, reply_barged = [], [], None, False
             if not listening:
                 speech, in_speech, pre, pending = [], False, [], []
                 continue
