@@ -5,9 +5,11 @@ import type { VoiceMode } from '../types'
 
 const PORT = 47821
 const BASE = `http://127.0.0.1:${PORT}`
-const VOICE = 'Microsoft Hazel Desktop'
+// A Piper voice (natural, offline). The listener downloads it the first time and uses the
+// Windows voice until it is ready.
+const VOICE = 'en_GB-jenny_dioco-medium'
 const MAX_SPOKEN = 700
-const LISTENER_VERSION = 5
+const LISTENER_VERSION = 7
 const BACKSLASH = String.fromCharCode(92)
 
 const mode = atom({ plugin: 'voice-chat', key: 'mode' } as const, 'off' as VoiceMode, { shape: 'mode-1' })
@@ -102,7 +104,7 @@ async function startListener($: EngineInterface): Promise<boolean> {
   const log = fwd(`${$.plugin.root}/scripts/listener.log`)
   const ps =
     `Start-Process -WindowStyle Hidden -FilePath python -ArgumentList ` +
-    `'"${script}"','--port','${PORT}','--log','"${log}"'`
+    `'"${script}"','--port','${PORT}','--log','"${log}"','--voice','${VOICE}'`
   try {
     const r = await $.process.run(['powershell', '-NoProfile', '-NonInteractive', '-Command', ps], {
       timeoutMs: 20_000,

@@ -3,21 +3,21 @@
 Talk to Claude Code hands-free. Say your prompt, and Claude reads its reply out loud.
 
 - 🎙️ **Speech in:** local [Whisper](https://github.com/SYSTRAN/faster-whisper) (`base.en`) runs on your own machine. Your audio never leaves your PC.
-- 🔊 **Speech out:** replies are read aloud by the Windows voice. Code blocks are skipped, and long answers are cut short with "the rest is on screen".
+- 🔊 **Speech out:** replies are read aloud in a natural voice ([Piper](https://github.com/OHF-Voice/piper1-gpl) with the Jenny (Dioco) voice, also running locally). Code blocks are skipped, and long answers are cut short with "the rest is on screen".
 - ✋ **Cut in any time:** talk over a reply and it stops, and what you said becomes your next prompt. Saying just "stop" stops it. Typing anything stops it too. It tells your voice from its own echo, so it never interrupts itself.
 - 📊 **Status band** above the prompt shows the current state, a mic level meter, and the last thing it heard.
 
 ## Requirements
 
-- Windows (spoken replies use Windows' built-in System.Speech)
+- Windows
 - Python 3.9+ on your `PATH` as `python`
 - The Python packages:
 
 ```bash
-pip install faster-whisper sounddevice numpy
+pip install faster-whisper sounddevice numpy piper-tts
 ```
 
-The first time you turn it on, Whisper downloads the `base.en` model (about 150 MB).
+The first time you turn it on, Whisper downloads the `base.en` model (about 150 MB) and the Jenny voice downloads in the background (about 63 MB). The Windows voice reads replies until Jenny is ready.
 
 - Plugin hooks modules turned on. They are an early-access Claude Code feature, and without this the plugin installs but does nothing. Run this once, then restart Claude Code:
 
@@ -67,3 +67,8 @@ To cut in by voice, just talk over the reply, as early as you like: it starts li
 - The listener runs as a small local server on `127.0.0.1:47821`. It exits by itself about 20 seconds after Claude Code stops checking on it.
 - If something goes wrong, the status band says what (a missing package, no Python), and `scripts/listener.log` in the plugin folder has the details.
 - Run the plugin's tests with `claude plugin test <plugin folder>`.
+
+## Credits
+
+- Speech in: [faster-whisper](https://github.com/SYSTRAN/faster-whisper).
+- Speech out: [Piper](https://github.com/OHF-Voice/piper1-gpl), installed separately, with the voice **Jenny (Dioco)** from the [Jenny TTS dataset](https://github.com/dioco-group/jenny-tts-dataset).

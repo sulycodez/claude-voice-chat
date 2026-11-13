@@ -12,7 +12,7 @@ test('a spoken prompt is sent, the reply is read out, then the mic reopens', asy
   await clock.settle()
   expect(L.spoken.length).toBe(1)
   expect(L.spoken[0]?.text).toContain('(code on screen)')
-  expect(L.spoken[0]?.voice).toBe('Microsoft Hazel Desktop')
+  expect(L.spoken[0]?.voice).toBe('en_GB-jenny_dioco-medium')
   expect(await bandText($)).toContain('Speaking')
 
   L.state = 'listening' // the listener finished reading it out

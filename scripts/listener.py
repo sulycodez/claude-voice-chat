@@ -6,28 +6,29 @@ POST /listen  -> resume listening      POST /pause -> stop listening (and any sp
 POST /speak   -> body {"text", "voice"}: read it aloud, then listen. Talking over it interrupts.
 POST /stop    -> stop speaking now and listen
 POST /quit    -> exit
-Exits by itself if nobody polls for WATCHDOG_S seconds (mod unloaded / session closed).
+Exits by itself if nobody polls for --idle-exit seconds (the agent or session went away).
 """
-import argparse, json, os, queue, re, subprocess, sys, tempfile, threading, time, traceback, wave
+import argparse, difflib, json, os, queue, re, subprocess, sys, tempfile, threading, time, traceback, wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 p = argparse.ArgumentParser()
 p.add_argument("--port", type=int, default=47821)
 p.add_argument("--model", default="base.en")
 p.add_argument("--log", default=None)
+p.add_argument("--voice", default="", help="Piper voice to load at start, so the first reply is quick")
+p.add_argument("--idle-exit", type=float, default=20, help="exit after this many seconds with nobody polling")
 args = p.parse_args()
 
 RATE, FRAME = 16000, 480            # 30 ms frames
-SILENCE_END_S = 0.9                 # this much quiet ends an utterance
-HOLD_S = 0.7                        # then wait this long for more before sending, so a pause to think doesn't cut you off
+SILENCE_END_S = 0.75                # this much quiet ends an utterance
+HOLD_S = 0.5                        # then wait this long for more before sending, so a pause to think doesn't cut you off
 MIN_SPEECH_S, MAX_SPEECH_S = 0.35, 30
 PRE_ROLL = 20                       # frames (0.6 s) kept from before speech starts, so the first word isn't clipped
 MIN_THRESHOLD = 0.005               # quiet laptop mics sit far below the old 0.012
 MAX_THRESHOLD = 0.04                # so a noisy start can never make a normal voice too quiet to hear
 FLOOR_WINDOW = 330                  # frames (10 s) the noise floor is re-measured over, all the time
 NO_AUDIO_S = 3                      # no frames from the mic this long means it was unplugged or taken
-WATCHDOG_S = 20
-VERSION = 5                         # the mod replaces a listener that reports another version
+VERSION = 7                         # the mod replaces a listener that reports another version
 JUNK = {"", "you", "thank you", "thanks for watching", "bye", "uh", "um", "hmm", "."}
 # Talking over a reply: your voice has to beat the reply's own echo by this much, for this long.
 BARGE_RATIO, BARGE_FRAMES, BARGE_WINDOW = 3.0, 6, 12  # loud in 6 of any 12 frames (360 ms): a short "stop" counts, a click doesn't
@@ -84,6 +85,21 @@ class H(BaseHTTPRequestHandler):
 
 SPEAKER = None
 
+def is_echo(heard, said):
+    """Was this our own reply coming back through the mic? Whisper garbles it a bit, so
+    compare words: nearly all of them in the reply, or most of them with a run of three
+    in a row. Someone cutting in says words the reply doesn't."""
+    h = re.findall(r"[a-z0-9']+", heard.lower()); sw = re.findall(r"[a-z0-9']+", said.lower())
+    if not h or not sw: return False
+    s_set = set(sw)
+    near = lambda w: w in s_set or (len(w) >= 4 and difflib.get_close_matches(w, s_set, n=1, cutoff=0.8))
+    hit = sum(bool(near(w)) for w in h) / len(h)
+    if len(h) <= 2: return hit == 1.0
+    if hit >= 0.75: return True
+    said_txt = " " + " ".join(sw) + " "
+    run3 = any(" " + " ".join(h[i:i + 3]) + " " in said_txt for i in range(len(h) - 2))
+    return hit >= 0.5 and run3
+
 def fit_echo(np, mic_hist, ref):
     """Does the mic follow the reply? Correlate the mic's level with the reply's level at
     each delay up to 0.9 s. A mic with no echo cancelling follows it closely, and then the
@@ -104,8 +120,56 @@ def fit_echo(np, mic_hist, ref):
     if act.sum() < 15: return None
     return (best_lag, min(max(float(np.median(mr[act] / x[act])), 0.01), 2.0), best_c)
 
+VOICE_DIR = os.environ.get("VOICE_CHAT_VOICES") or os.path.join(os.path.expanduser("~"), ".cache", "voice-chat", "voices")
+FALLBACK_VOICE = "Microsoft Hazel Desktop"
+_piper = {}
+
+def fetch_voice(name):
+    """Download a missing Piper voice (about 63 MB, once) from the Piper project on Hugging
+    Face, then use it from the next reply. Until then the Windows voice speaks."""
+    onnx = os.path.join(VOICE_DIR, name + ".onnx")
+    if not name or name.startswith("Microsoft") or (os.path.exists(onnx) and os.path.exists(onnx + ".json")): return
+    try:
+        import urllib.request
+        region, quality, speaker = name.split("-")[0], name.split("-")[-1], "-".join(name.split("-")[1:-1])
+        base = f"https://huggingface.co/rhasspy/piper-voices/resolve/main/{region.split('_')[0]}/{region}/{speaker}/{quality}/{name}"
+        os.makedirs(VOICE_DIR, exist_ok=True)
+        log(f"downloading voice {name}")
+        for suffix in (".onnx.json", ".onnx"):
+            dest = os.path.join(VOICE_DIR, name + suffix); part = dest + ".part"
+            with urllib.request.urlopen(base + suffix, timeout=30) as r, open(part, "wb") as f:
+                while True:
+                    block = r.read(1 << 20)
+                    if not block: break
+                    f.write(block)
+            os.replace(part, dest)
+        _piper.pop(name, None)   # pick it up on the next reply
+        log(f"voice {name} ready")
+    except Exception as e:
+        log(f"could not download voice {name}: {e!r}")
+
+def piper_voice(name):
+    """A Piper neural voice (natural sounding, runs offline) if it is installed and
+    downloaded, else None and the Windows voice is used instead."""
+    if not name or name.startswith("Microsoft"): return None
+    if name not in _piper:
+        path = os.path.join(VOICE_DIR, name + ".onnx")
+        try:
+            from piper import PiperVoice
+            _piper[name] = PiperVoice.load(path) if os.path.exists(path) else None
+            if _piper[name] is None: log(f"voice {name} not downloaded, using the Windows voice")
+        except Exception as e:
+            log("Piper unavailable, using the Windows voice:", repr(e)); _piper[name] = None
+    return _piper[name]
+
 def synth(text, voice, np):
-    """Windows' own voice renders the text to a 16 kHz WAV, read back as float samples."""
+    """The reply as float samples and their rate: Piper if it is set up, else Windows' own voice."""
+    v = piper_voice(voice)
+    if v is not None:
+        chunks = list(v.synthesize(text))
+        if not chunks: return np.zeros(0, dtype="float32"), RATE
+        return np.concatenate([c.audio_float_array for c in chunks]).astype("float32"), chunks[0].sample_rate
+    if not voice.startswith("Microsoft"): voice = FALLBACK_VOICE
     fd, path = tempfile.mkstemp(suffix=".wav"); os.close(fd)
     q = lambda v: v.replace("'", "''")
     ps = ("[Console]::InputEncoding = [Text.Encoding]::UTF8; Add-Type -AssemblyName System.Speech; "
@@ -118,7 +182,7 @@ def synth(text, voice, np):
         subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], input=text.encode("utf-8"),
                        capture_output=True, timeout=60, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         with wave.open(path) as w:
-            return np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype("float32") / 32768
+            return np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype("float32") / 32768, RATE
     finally:
         try: os.remove(path)
         except OSError: pass
@@ -131,18 +195,46 @@ class Speaker:
         self.mx = threading.Lock()
         self.gen, self.stream, self.ref = 0, None, []
         self.audible_since = None   # when the reply first made a sound
+        self.play = None            # the reply playing now: its place, so a false alarm can carry on
+        self.text = ""              # what it is saying
+        self.last = ("", 0.0)       # what it said last, and when it ended
 
     def speak(self, text, voice):
         gen = self.stop()
+        self.text = text
         threading.Thread(target=self._play, args=(text, voice, gen), daemon=True).start()
 
     def stop(self):
         with self.mx:
             self.gen += 1; st, self.stream = self.stream, None
+            if self.play is not None: self.last = (self.text, time.time())
+            self.play = None
         if st is not None:
             try: st.abort(); st.close()
             except Exception: pass
         return self.gen
+
+    def pause(self):
+        """Go quiet but keep the place, in case what interrupted was only our own echo."""
+        with self.mx:
+            st, self.stream = self.stream, None
+            if self.play is not None: self.play["paused"] = True
+        if st is not None:
+            try: st.abort(); st.close()
+            except Exception: pass
+
+    def resume(self):
+        """Carry on from half a second before the pause. False if there is nothing to resume."""
+        with self.mx:
+            p = self.play
+            if p is None or not p["paused"]: return False
+            p["paused"] = False
+            p["pos"][0] = max(0, p["pos"][0] - p["sr"] // 2)
+            self.audible_since = None   # echo cancelling settles again after a restart
+            self.stream = self.sd.OutputStream(samplerate=p["sr"], channels=1, dtype="float32", blocksize=FRAME,
+                                               callback=p["cb"], finished_callback=p["fin"])
+            self.stream.start()
+        return True
 
     def _play(self, text, voice, gen):
         np, sd = self.np, self.sd
@@ -159,13 +251,14 @@ class Speaker:
             try:
                 return synth(piece, voice, np)
             except Exception as e:
-                log("speech failed:", repr(e)); return np.zeros(0, dtype="float32")
-        buf = {"a": render(pieces[0]) if pieces else np.zeros(0, dtype="float32"), "done": len(pieces) <= 1}
-        log(f"speaking, first part {len(buf['a']) / RATE:.1f}s rendered in {time.time() - t0:.1f}s, {len(pieces)} parts")
+                log("speech failed:", repr(e)); return np.zeros(0, dtype="float32"), RATE
+        first, sr = render(pieces[0]) if pieces else (np.zeros(0, dtype="float32"), RATE)
+        buf = {"a": first, "done": len(pieces) <= 1}
+        log(f"speaking, first part {len(first) / sr:.1f}s rendered in {time.time() - t0:.1f}s, {len(pieces)} parts")
         def render_rest():
             for piece in pieces[1:]:
                 if self.gen != gen: return
-                buf["a"] = np.concatenate([buf["a"], render(piece)])
+                buf["a"] = np.concatenate([buf["a"], render(piece)[0]])
             buf["done"] = True
         threading.Thread(target=render_rest, daemon=True).start()
         audio = buf["a"]
@@ -182,21 +275,24 @@ class Speaker:
             if r > 0.003 and self.audible_since is None: self.audible_since = time.time()
             if len(ref) > 200: del ref[0]
             if buf["done"] and pos[0] >= len(buf["a"]): raise sd.CallbackStop()
+        play = {"pos": pos, "paused": False, "sr": sr}
         def finished():
             with self.mx:
-                if self.gen != gen: return
-                self.stream = None
+                if self.gen != gen or play["paused"]: return
+                self.stream, self.play = None, None
+                self.last = (text, time.time())
             with lock:
                 if S["state"] == "speaking": S["state"] = "listening"
             log("spoke to the end")
+        play["cb"], play["fin"] = cb, finished
         with self.mx:
             if self.gen != gen: return
             if not len(audio) and buf["done"]:
                 with lock:
                     if S["state"] == "speaking": S["state"] = "listening"
                 return
-            self.ref = ref
-            self.stream = sd.OutputStream(samplerate=RATE, channels=1, dtype="float32", blocksize=FRAME,
+            self.ref, self.play = ref, play
+            self.stream = sd.OutputStream(samplerate=sr, channels=1, dtype="float32", blocksize=FRAME,
                                           callback=cb, finished_callback=finished)
             self.stream.start()
 
@@ -206,7 +302,7 @@ class Speaker:
 
 def should_stop():
     with lock:
-        return S["quit"] or time.time() - S["last_poll"] > WATCHDOG_S
+        return S["quit"] or time.time() - S["last_poll"] > args.idle_exit
 
 def run():
     import numpy as np
@@ -218,6 +314,10 @@ def run():
     log("model ready")
     global SPEAKER
     SPEAKER = Speaker(np, sd)
+    if args.voice:
+        def warm(name):
+            fetch_voice(name); piper_voice(name)   # download if missing, then load, so replies start fast
+        threading.Thread(target=warm, args=(args.voice,), daemon=True).start()
 
     audio_q: "queue.Queue[np.ndarray]" = queue.Queue()
     def cb(indata, frames, t, status):
@@ -253,6 +353,7 @@ def run():
         # measured, "none" when echo cancelling removes it, or (delay, size, fit). It is kept
         # only from replies nobody talked over, so your voice is never learned as echo.
         loud, barged, echo_model, mic_hist, reply_model, reply_barged = [], False, None, [], None, False
+        strict = 1.0   # raised each time our own voice set it off, so it doesn't keep stuttering
         margins = []
         while not should_stop():
             with lock:
@@ -303,11 +404,12 @@ def run():
                     e = SPEAKER.echo(now, use[0])
                     # A tight fit means the echo estimate is precise, so a smaller margin is safe.
                     bar = max(threshold * 3, (2.0 if use[2] >= 0.8 else BARGE_RATIO) * use[1] * e + threshold)
+                bar *= strict
                 margins.append(rms / bar)
                 loud = (loud + [rms > bar])[-BARGE_WINDOW:]
                 if sum(loud) >= BARGE_FRAMES:
-                    log(f"talked over the reply (mic {rms:.3f}, bar {bar:.3f}, echo model {use if use == 'none' else tuple(round(v, 3) for v in use)})")
-                    SPEAKER.stop()
+                    log(f"talked over the reply? (mic {rms:.3f}, bar {bar:.3f}, echo model {use if use == 'none' else tuple(round(v, 3) for v in use)})")
+                    SPEAKER.pause()   # quiet, but keep the place until we know it was you
                     with lock:
                         if S["state"] == "speaking": S["state"] = "transcribing"
                     # Rewind to where you started: back to the last half second of quiet.
@@ -327,6 +429,7 @@ def run():
                 log(f"loudest echo vs interrupt bar: p50 {m[len(m) // 2]:.2f} p99 {m[int(len(m) * 0.99)]:.2f} "
                     f"max {m[-1]:.2f} (1.0 interrupts); echo model {echo_model if not isinstance(echo_model, tuple) else tuple(round(v, 3) for v in echo_model)}")
                 margins = []
+                strict = max(1.0, strict * 0.85)
             loud, mic_hist, reply_model, reply_barged = [], [], None, False
             if not listening:
                 speech, in_speech, pre, pending = [], False, [], []
@@ -353,9 +456,22 @@ def run():
                 with lock: S["state"] = "transcribing"
                 text = transcribe(buf)
                 log("heard:", repr(text))
-                if barged and text.lower().strip(" .!?,") in STOP_WORDS:
-                    text = ""   # "stop" just stops the reply
-                barged = False
+                if barged:
+                    barged = False
+                    if not text or is_echo(text, SPEAKER.text):
+                        # Our own voice (or a noise), not you: carry on, and be harder to set off.
+                        strict = min(strict * 2, 8.0)
+                        log(f"that was my own voice or a noise, carrying on (now {strict:.0f}x stricter)")
+                        resumed = SPEAKER.resume()
+                        with lock:
+                            if S["state"] == "transcribing": S["state"] = "speaking" if resumed else "listening"
+                        continue
+                    SPEAKER.stop()
+                    if text.lower().strip(" .!?,") in STOP_WORDS:
+                        text = ""   # "stop" just stops the reply
+                elif text and SPEAKER and time.time() - SPEAKER.last[1] < 4 and is_echo(text, SPEAKER.last[0]):
+                    log("that was the end of my own reply echoing, ignored")
+                    text = ""
                 if text:
                     pending.append(text); send_at = time.time() + HOLD_S
                 elif not pending:
