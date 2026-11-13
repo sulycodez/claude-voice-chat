@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, ModelEffort, Register } from 'claude-code'
 
-import type { VoiceMode } from '../types'
+import type { VoiceMode, VoiceSpeed } from '../types'
 
 const PORT = 47821
 const BASE = `http://127.0.0.1:${PORT}`
@@ -9,13 +9,23 @@ const BASE = `http://127.0.0.1:${PORT}`
 // Windows voice until it is ready.
 const VOICE = 'en_GB-jenny_dioco-medium'
 const MAX_SPOKEN = 700
-const LISTENER_VERSION = 7
+const LISTENER_VERSION = 8
 const BACKSLASH = String.fromCharCode(92)
 
 const mode = atom({ plugin: 'voice-chat', key: 'mode' } as const, 'off' as VoiceMode, { shape: 'mode-1' })
 const level = atom({ plugin: 'voice-chat', key: 'level' } as const, 0, { shape: 'level-1' })
 const lastHeard = atom({ plugin: 'voice-chat', key: 'lastHeard' } as const, '', { shape: 'heard-1' })
 const problem = atom({ plugin: 'voice-chat', key: 'problem' } as const, '', { shape: 'problem-1' })
+const speed = atom({ plugin: 'voice-chat', key: 'speed' } as const, 'auto' as VoiceSpeed, { shape: 'speed-1' })
+const effortNow = atom({ plugin: 'voice-chat', key: 'effortNow' } as const, '', { shape: 'effort-1' })
+
+// How hard Claude thinks about a spoken question. Typed prompts keep the session's own setting.
+const SPEEDS: readonly VoiceSpeed[] = ['auto', 'quick', 'balanced', 'thorough']
+const EFFORT: Record<Exclude<VoiceSpeed, 'auto'>, ModelEffort> = { quick: 'low', balanced: 'medium', thorough: 'high' }
+const SORT =
+  'You sort spoken questions for a voice assistant. Reply with one word. ' +
+  'QUICK: a fact, date, time, definition, yes or no, small talk, or a short follow-up. ' +
+  'DEEP: an explanation of something complex, code to write or change, a plan, a comparison, or a decision.'
 
 const LABEL: Record<VoiceMode, string | undefined> = {
   off: undefined,
@@ -33,6 +43,26 @@ type Poll = { texts: string[]; state: string; level: number; error?: string; ver
 let ticker: { cancel: () => void } | undefined
 let polling = false
 let misses = 0
+// The effort chosen for the spoken prompt just submitted, then the turn it started.
+let pendingEffort: ModelEffort | undefined
+let voiceTurn: { id: string; effort: ModelEffort } | undefined
+
+/** The effort for a spoken question: fixed by the speed setting, or in auto, sorted by a
+ * quick Haiku call (at most 2 s; medium if it can't tell in time). */
+async function effortFor($: EngineInterface, text: string): Promise<ModelEffort> {
+  const s = await read($, speed)
+  if (s !== 'auto') return EFFORT[s]
+  try {
+    const r = await Promise.race([
+      $.model.complete({ model: 'haiku', effort: 'low', maxTokens: 5, system: SORT, prompt: text }),
+      $.clock.sleep(2000).then(() => undefined),
+    ])
+    if (r && r.isAnswered) return /quick/i.test(r.text) ? 'low' : 'high'
+  } catch {
+    // no answer: fall through
+  }
+  return 'medium'
+}
 
 async function fail($: EngineInterface, why: string) {
   await update($, problem, () => why)
@@ -157,6 +187,8 @@ function startPolling($: EngineInterface) {
       if (text && (m === 'listening' || m === 'hearing' || m === 'speaking')) {
         await update($, lastHeard, () => text)
         await setMode($, 'thinking')
+        pendingEffort = await effortFor($, text)
+        await update($, effortNow, () => pendingEffort ?? '')
         await $.prompt.submit({ text, asUser: true })
       }
     } finally {
@@ -178,13 +210,14 @@ async function turnOff($: EngineInterface) {
   await setMode($, 'off')
 }
 
-const USAGE = 'Usage: /voice-chat on, /voice-chat off, /voice-chat stop (cut a reply short), or /voice-chat to toggle.'
+const USAGE =
+  'Usage: /voice-chat on, /voice-chat off, /voice-chat stop (cut a reply short), /voice-chat speed auto|quick|balanced|thorough, or /voice-chat to toggle.'
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'voice-chat',
-      description: 'Hands-free voice: /voice-chat on | off | stop (speak prompts, hear replies)',
+      description: 'Hands-free voice: /voice-chat on | off | stop | speed (speak prompts, hear replies)',
     })
     // After a reload, pick up where we were.
     if ((await read($, mode)) !== 'off') void turnOn($)
@@ -194,6 +227,20 @@ export const register: Register = on => {
   on('command.run', { command: 'voice-chat' }, async ($, e) => {
     const arg = (e.args ?? '').trim().toLowerCase()
     const isOn = (await read($, mode)) !== 'off'
+    if (arg === 'speed' || arg.startsWith('speed ')) {
+      const want = arg.slice(5).trim()
+      if (want === '') return { text: `Speed is ${await read($, speed)}. Options: ${SPEEDS.join(', ')}.` }
+      if (!(SPEEDS as readonly string[]).includes(want)) return { text: `Speed options: ${SPEEDS.join(', ')}.` }
+      const sp = want as VoiceSpeed
+      await update($, speed, () => sp)
+      const what: Record<VoiceSpeed, string> = {
+        auto: 'quick questions get quick answers, complex ones get proper thinking',
+        quick: 'fastest answers, light thinking',
+        balanced: 'medium thinking',
+        thorough: 'careful answers, takes longer',
+      }
+      return { text: `Speed set to ${sp}: ${what[sp]}. Only spoken questions are affected.` }
+    }
     if (arg === 'stop' || arg === 'skip') {
       if (!isOn) return { text: 'Voice chat is off.' }
       await post($, '/stop')
@@ -223,9 +270,24 @@ export const register: Register = on => {
     return next(e)
   }).catch(($, e, next) => next(e))
 
+  // The turn a spoken prompt starts thinks as hard as its speed says; nothing else changes.
+  on('turn.start', async ($, e, next) => {
+    if (!e.agentId && pendingEffort) {
+      voiceTurn = { id: e.turnId, effort: pendingEffort }
+      pendingEffort = undefined
+    }
+    return next(e)
+  })
+
+  on('turn.step', async function* ($, e, next) {
+    if (!e.agentId && voiceTurn && e.turnId === voiceTurn.id) return yield* next({ ...e, effort: voiceTurn.effort })
+    return yield* next(e)
+  })
+
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
     if (e.agentId) return done
+    if (voiceTurn && e.turnId === voiceTurn.id) voiceTurn = undefined
     const m = await read($, mode)
     if (m === 'off' || m === 'starting' || m === 'error') return done
     const text = e.reason === 'answer' ? speakable(e.answer) : ''
@@ -248,6 +310,8 @@ export const register: Register = on => {
     const lvl = await read($, level)
     const heard = await read($, lastHeard)
     const why = await read($, problem)
+    const sp = await read($, speed)
+    const eff = await read($, effortNow)
     const bars = 10
     const lit = m === 'listening' || m === 'hearing' ? Math.round(lvl * bars) : 0
     const meter = '\u25AE'.repeat(lit) + '\u25AF'.repeat(bars - lit)
@@ -259,6 +323,8 @@ export const register: Register = on => {
         </Text>
         {(m === 'listening' || m === 'hearing') && <Text color="success">{meter}</Text>}
         {m === 'error' && why !== '' && <Text color="error">{why}</Text>}
+        {m === 'thinking' && eff !== '' && <Text dimColor>{`${eff} effort`}</Text>}
+        {m !== 'error' && m !== 'thinking' && <Text dimColor>{`speed: ${sp}`}</Text>}
         {m !== 'error' && heard !== '' && (
           <Text dimColor>last heard: "{heard.length > 60 ? heard.slice(0, 59) + '\u2026' : heard}"</Text>
         )}

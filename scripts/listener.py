@@ -28,7 +28,7 @@ MIN_THRESHOLD = 0.005               # quiet laptop mics sit far below the old 0.
 MAX_THRESHOLD = 0.04                # so a noisy start can never make a normal voice too quiet to hear
 FLOOR_WINDOW = 330                  # frames (10 s) the noise floor is re-measured over, all the time
 NO_AUDIO_S = 3                      # no frames from the mic this long means it was unplugged or taken
-VERSION = 7                         # the mod replaces a listener that reports another version
+VERSION = 8                         # the mod replaces a listener that reports another version
 JUNK = {"", "you", "thank you", "thanks for watching", "bye", "uh", "um", "hmm", "."}
 # Talking over a reply: your voice has to beat the reply's own echo by this much, for this long.
 BARGE_RATIO, BARGE_FRAMES, BARGE_WINDOW = 3.0, 6, 12  # loud in 6 of any 12 frames (360 ms): a short "stop" counts, a click doesn't
@@ -122,7 +122,7 @@ def fit_echo(np, mic_hist, ref):
 
 VOICE_DIR = os.environ.get("VOICE_CHAT_VOICES") or os.path.join(os.path.expanduser("~"), ".cache", "voice-chat", "voices")
 FALLBACK_VOICE = "Microsoft Hazel Desktop"
-_piper = {}
+_piper = {}   # voice name -> PiperProcess, or None when that voice can't be used
 
 def fetch_voice(name):
     """Download a missing Piper voice (about 63 MB, once) from the Piper project on Hugging
@@ -148,27 +148,72 @@ def fetch_voice(name):
     except Exception as e:
         log(f"could not download voice {name}: {e!r}")
 
+class PiperProcess:
+    """Piper runs as its own program, kept open with the voice loaded: send it a line of
+    text, it writes a WAV and says "Wrote <file>". This code never imports Piper; it only
+    talks to Piper's own command-line tool, which the user installs separately."""
+    def __init__(self, model):
+        self.model, self.mx, self.proc = model, threading.Lock(), None
+        self.out = tempfile.mkdtemp(prefix="voice-chat-")
+
+    def _start(self):
+        self.proc = subprocess.Popen(
+            [sys.executable, "-m", "piper", "-m", self.model, "--output-dir", self.out],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace", bufsize=1,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+    def render(self, text, np):
+        with self.mx:
+            for attempt in (1, 2):   # one restart if Piper had exited
+                if self.proc is None or self.proc.poll() is not None: self._start()
+                try:
+                    self.proc.stdin.write(" ".join(text.split()) + "\n"); self.proc.stdin.flush()
+                    while True:
+                        line = self.proc.stderr.readline()
+                        if not line: raise RuntimeError("Piper exited")
+                        if "Wrote" in line: break
+                    path = line.split("Wrote", 1)[1].strip()
+                    with wave.open(path) as w:
+                        sr = w.getframerate()
+                        a = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype("float32") / 32768
+                    os.remove(path)
+                    return a, sr
+                except (OSError, RuntimeError, ValueError) as e:
+                    log(f"Piper failed ({e!r})" + (", restarting it" if attempt == 1 else ""))
+                    self.close()
+            raise RuntimeError("Piper is not working")
+
+    def close(self):
+        if self.proc is not None:
+            try: self.proc.kill()
+            except Exception: pass
+            self.proc = None
+
 def piper_voice(name):
-    """A Piper neural voice (natural sounding, runs offline) if it is installed and
+    """A Piper voice (natural sounding, runs offline) if Piper is installed and the voice
     downloaded, else None and the Windows voice is used instead."""
     if not name or name.startswith("Microsoft"): return None
     if name not in _piper:
+        import importlib.util
         path = os.path.join(VOICE_DIR, name + ".onnx")
-        try:
-            from piper import PiperVoice
-            _piper[name] = PiperVoice.load(path) if os.path.exists(path) else None
-            if _piper[name] is None: log(f"voice {name} not downloaded, using the Windows voice")
-        except Exception as e:
-            log("Piper unavailable, using the Windows voice:", repr(e)); _piper[name] = None
+        if importlib.util.find_spec("piper") is None:
+            log("Piper is not installed, using the Windows voice"); _piper[name] = None
+        elif not os.path.exists(path):
+            log(f"voice {name} not downloaded, using the Windows voice"); _piper[name] = None
+        else:
+            _piper[name] = PiperProcess(path)
     return _piper[name]
 
 def synth(text, voice, np):
     """The reply as float samples and their rate: Piper if it is set up, else Windows' own voice."""
     v = piper_voice(voice)
-    if v is not None:
-        chunks = list(v.synthesize(text))
-        if not chunks: return np.zeros(0, dtype="float32"), RATE
-        return np.concatenate([c.audio_float_array for c in chunks]).astype("float32"), chunks[0].sample_rate
+    if v is not None and text.strip():
+        try:
+            return v.render(text, np)
+        except RuntimeError:
+            _piper[voice] = None   # give up on Piper for this run: the Windows voice takes over
+            log("Piper stopped working, using the Windows voice")
     if not voice.startswith("Microsoft"): voice = FALLBACK_VOICE
     fd, path = tempfile.mkstemp(suffix=".wav"); os.close(fd)
     q = lambda v: v.replace("'", "''")
@@ -316,7 +361,12 @@ def run():
     SPEAKER = Speaker(np, sd)
     if args.voice:
         def warm(name):
-            fetch_voice(name); piper_voice(name)   # download if missing, then load, so replies start fast
+            # download if missing, then start Piper with the voice loaded, so replies start fast
+            fetch_voice(name)
+            v = piper_voice(name)
+            if v is not None:
+                try: v.render("Ready.", np)
+                except RuntimeError: _piper[name] = None
         threading.Thread(target=warm, args=(args.voice,), daemon=True).start()
 
     audio_q: "queue.Queue[np.ndarray]" = queue.Queue()
@@ -506,5 +556,7 @@ except Exception as e:
     while not should_stop():
         time.sleep(0.5)
 
+for v in list(_piper.values()):
+    if v is not None: v.close()
 server.shutdown()
 log("exit")

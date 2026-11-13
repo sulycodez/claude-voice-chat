@@ -1,4 +1,5 @@
 export type VoiceMode = 'off' | 'starting' | 'listening' | 'hearing' | 'thinking' | 'speaking' | 'error'
+export type VoiceSpeed = 'auto' | 'quick' | 'balanced' | 'thorough'
 
 declare module 'claude-code' {
   interface PluginState {
@@ -7,6 +8,8 @@ declare module 'claude-code' {
       level: Shaped<number>
       lastHeard: Shaped<string>
       problem: Shaped<string>
+      speed: Shaped<VoiceSpeed>
+      effortNow: Shaped<string>
     }
   }
 }

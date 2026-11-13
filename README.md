@@ -49,10 +49,13 @@ In the Claude desktop app, where `/plugin` doesn't run: click **+** next to the 
 | --- | --- |
 | `/voice-chat on` | Start the mic listener. When the band shows **Listening**, just talk. |
 | `/voice-chat stop` | Cut the reply being read out short and listen. |
+| `/voice-chat speed auto` | How hard Claude thinks about what you say: `quick`, `balanced`, `thorough`, or `auto` (the default: quick questions get quick answers, complex ones get proper thinking). |
 | `/voice-chat off` | Stop listening and release the mic. |
 | `/voice-chat` | Toggle. |
 
 When you stop talking for about a second and a half, what you said is sent as your prompt. A shorter pause to think doesn't cut you off: keep going and it's all sent together.
+
+**Speed:** `quick` sets low thinking effort on spoken questions, `balanced` medium, `thorough` high. `auto` asks a fast model (Haiku) whether each question is quick or needs thinking, which adds well under a second. Typed prompts keep your normal settings. The band shows the speed, and the effort while Claude thinks.
 
 You can type at any time. A typed prompt stops any reply being read out, and the mic waits until its own reply is done.
 
